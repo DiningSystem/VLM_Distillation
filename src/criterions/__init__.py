@@ -14,6 +14,7 @@ from src.criterions.scva_cgkd import SCVACGKDCriterion
 from src.criterions.scva_sic import SCVASICCriterion
 from src.criterions.sre import SRECriterion
 from src.criterions.unit_aligned import UnitAlignedDistillationCriterion
+from src.criterions.ugrimd import UGRIMDCriterion
 
 
 criterion_list = {
@@ -38,6 +39,8 @@ criterion_list = {
     "draft": SCVACGKDCriterion,
     "scva_sic": SCVASICCriterion,
     "sic": SCVASICCriterion,
+    "ugrimd": UGRIMDCriterion,
+    "uncertainty_gated_ranking_interaction": UGRIMDCriterion,
 }
 
 
@@ -65,6 +68,7 @@ __all__ = [
     "SCVASICCriterion",
     "SRECriterion",
     "UnitAlignedDistillationCriterion",
+    "UGRIMDCriterion",
     "build_criterion",
     "criterion_list",
     "default_distillation_criterion",
