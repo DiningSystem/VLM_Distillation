@@ -56,13 +56,14 @@ This repository is used to fine-tune and distill Vision-Language Models (VLMs) w
 | `unit_aligned.py` | Joint SRE + EM-KD criterion for unit-aligned distillation. |
 | `scva.py` | SCVA: semantic-cluster visual attention loss for vision tokens. |
 | `cgkd.py` | CGKD: confidence-gated generative KD. |
+| `ugrimd.py` | UGRIMD: uncertainty-gated within-sample candidate ranking plus multimodal interaction distillation. |
 | `scva_cgkd.py` | Joint SCVA + CGKD criterion. Also available through the `draft` alias. |
 | `dwa_kd.py` | DWA-KD with KL, hidden/logit losses, SoftDTW, and projectors. |
 | `dskd_v2.py` | DSKD v2 with teacher-to-student/student-to-teacher projectors and top-k vocabulary config. |
 | `mcw_kd.py` | MCW-KD with OT/Sinkhorn losses for logits and hidden context. |
 | `cross_entropy_loss.py`, `various_divergence.py`, `soft_dtw_cuda.py`, `etp.py` | Shared loss helpers used by multiple criteria. |
 
-Mapped `--kd_loss_type` values include: `ce_only`, `default`, `default_distillation`, `emkd`, `em_kd`, `sre`, `dwa_kd`, `dwakd`, `dskd_v2`, `dskdv2`, `mcw_kd`, `mcwkd`, `joint`, `unit_aligned`, `unit_aligned_distillation`, `scva`, `cgkd`, `scva_cgkd`, and `draft`.
+Mapped `--kd_loss_type` values include: `ce_only`, `default`, `default_distillation`, `emkd`, `em_kd`, `sre`, `dwa_kd`, `dwakd`, `dskd_v2`, `dskdv2`, `mcw_kd`, `mcwkd`, `joint`, `unit_aligned`, `unit_aligned_distillation`, `scva`, `cgkd`, `scva_cgkd`, `ugrimd`, and `draft`.
 
 ## Training Scripts
 
@@ -77,6 +78,7 @@ Mapped `--kd_loss_type` values include: `ce_only`, `default`, `default_distillat
 | `script_train/unit_aligned/` | Joint/unit-aligned recipes. |
 | `script_train/scva/` | SCVA recipes. |
 | `script_train/cgkd/` | CGKD recipes. |
+| `script_train/ugrimd/` | Stage-2 UGRIMD recipes for all three supported teacher-student pairs; each loads its matching Stage-1 SFT LoRA checkpoint from `script_train/sft/` (override with `SFT_CHECKPOINT`). |
 | `script_train/scva_cgkd/` | SCVA + CGKD recipes. |
 | `script_train/dwa_kd/` | DWA-KD recipes. |
 | `script_train/dskd_v2/` | DSKD v2 recipes. The currently open file, `train_qwen3_teacher_4b_fastvlm_student_05b_dskd_v2_with_eta.sh`, lives here. |
