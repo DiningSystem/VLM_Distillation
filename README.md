@@ -78,7 +78,7 @@ Mapped `--kd_loss_type` values include: `ce_only`, `default`, `default_distillat
 | `script_train/unit_aligned/` | Joint/unit-aligned recipes. |
 | `script_train/scva/` | SCVA recipes. |
 | `script_train/cgkd/` | CGKD recipes. |
-| `script_train/ugrimd/` | UGRIMD recipes for all three supported teacher-student pairs. |
+| `script_train/ugrimd/` | Stage-2 UGRIMD recipes for all three supported teacher-student pairs; each loads its matching Stage-1 SFT LoRA checkpoint from `script_train/sft/` (override with `SFT_CHECKPOINT`). |
 | `script_train/scva_cgkd/` | SCVA + CGKD recipes. |
 | `script_train/dwa_kd/` | DWA-KD recipes. |
 | `script_train/dskd_v2/` | DSKD v2 recipes. The currently open file, `train_qwen3_teacher_4b_fastvlm_student_05b_dskd_v2_with_eta.sh`, lives here. |
