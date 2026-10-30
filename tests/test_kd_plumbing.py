@@ -146,5 +146,106 @@ class KDPlumbingTests(unittest.TestCase):
         self.assertTrue(torch.equal(teacher_onehot[:, 2:], torch.zeros(2, 2)))
 
 
+    def test_ugrimd_visual_reliability_is_bounded_and_pair_specific(self):
+        import torch
+        from src.criterions.ugrimd import UGRIMDCriterion
+
+        criterion = UGRIMDCriterion(SimpleNamespace(
+            visual_attention_layers=[1, 2, 3],
+            visual_weight_temperature=0.1,
+            visual_weight_floor=0.25,
+        ))
+        pair_i = torch.tensor([0])
+        pair_j = torch.tensor([1])
+        teacher_grounding = torch.tensor([[0.8, 0.2]])
+        aligned_student = torch.tensor([[0.7, 0.3]], requires_grad=True)
+        reversed_student = torch.tensor([[0.3, 0.7]], requires_grad=True)
+
+        aligned = criterion._visual_reliability(
+            teacher_grounding, aligned_student, pair_i, pair_j
+        )
+        reversed_weight = criterion._visual_reliability(
+            teacher_grounding, reversed_student, pair_i, pair_j
+        )
+
+        self.assertGreater(aligned.item(), reversed_weight.item())
+        self.assertGreaterEqual(reversed_weight.item(), 0.25)
+        self.assertLessEqual(aligned.item(), 1.0)
+        self.assertFalse(aligned.requires_grad)
+
+    def test_ugrimd_candidate_refresh_is_versioned_per_sample(self):
+        from src.criterions.ugrimd import UGRIMDCriterion
+
+        criterion = UGRIMDCriterion(SimpleNamespace(
+            num_candidates=2,
+            candidate_regenerate_steps=500,
+        ))
+        calls = []
+
+        def fake_generate(_distiller, _messages, answer):
+            calls.append((criterion.global_step, answer))
+            return [answer, f"generated-{criterion.global_step}"]
+
+        criterion._generate_candidates = fake_generate
+        messages = [[{
+            "role": "assistant",
+            "content": [{"type": "text", "text": "gold"}],
+        }]]
+
+        criterion.set_global_step(0)
+        criterion._candidates(None, ["a"], messages)
+        criterion.set_global_step(499)
+        criterion._candidates(None, ["a"], messages)
+        criterion.set_global_step(500)
+        criterion._candidates(None, ["b"], messages)
+        criterion._candidates(None, ["a"], messages)
+
+        self.assertEqual(calls, [(0, "gold"), (500, "gold"), (500, "gold")])
+
+    def test_ugrimd_interaction_uses_selected_sample_mean(self):
+        import torch
+        import torch.nn.functional as F
+        from src.criterions.ugrimd import UGRIMDCriterion
+
+        criterion = UGRIMDCriterion(SimpleNamespace(
+            candidate_temperature=1.0,
+            interaction_temperature=1.0,
+            interaction_strength_temperature=0.1,
+        ))
+        teacher_vl = torch.tensor([[2.0, 0.0], [0.5, 0.5]])
+        teacher_l = torch.tensor([[0.0, 2.0], [0.5, 0.5]])
+        student_vl = torch.tensor([[1.5, 0.0], [1.0, 0.0]], requires_grad=True)
+        student_l = torch.tensor([[0.0, 1.5], [0.0, 1.0]], requires_grad=True)
+        grounding = torch.tensor([[0.8, 0.2], [0.6, 0.4]])
+
+        _, interaction_loss, _, _, _ = criterion.compute_score_losses(
+            teacher_vl,
+            student_vl,
+            teacher_l,
+            student_l,
+            grounding,
+            grounding,
+        )
+
+        p_t_vl = torch.softmax(teacher_vl, dim=-1)
+        p_t_l = torch.softmax(teacher_l, dim=-1)
+        p_s_vl = torch.softmax(student_vl, dim=-1)
+        p_s_l = torch.softmax(student_l, dim=-1)
+        uncertainty = -(p_t_vl * p_t_vl.log()).sum(dim=-1) / torch.log(
+            torch.tensor(2.0)
+        )
+        teacher_shift = p_t_vl - p_t_l
+        strength = 0.5 * teacher_shift.abs().sum(dim=-1)
+        gate = uncertainty * strength / (strength + 0.1)
+        per_sample = F.smooth_l1_loss(
+            p_s_vl - p_s_l,
+            teacher_shift,
+            reduction="none",
+            beta=1.0,
+        ).mean(dim=-1)
+
+        self.assertTrue(torch.allclose(interaction_loss, (per_sample * gate).mean()))
+
+
 if __name__ == "__main__":
     unittest.main()

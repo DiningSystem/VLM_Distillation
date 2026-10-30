@@ -17,16 +17,15 @@ import torch.nn.functional as F
 
 from src.data.dataset import _make_labels_chatml
 
-
 IGNORE_INDEX = -100
 
 
 class UGRIMDCriterion(nn.Module):
     """Stage-2 CE plus hard-sample ranking and visual-shift matching.
 
-    Stage 1 is the repository's normal SFT path. Stage 2 keeps CE active,
-    mines uncertain student examples with random exploration, and combines
-    pair-normalized ranking with cross-condition probability-shift matching.
+    Stage 1 is the repository's normal SFT path.  Stage 2 keeps CE active,
+    mines examples from student candidate entropy, then uses detached teacher
+    uncertainty to route selected examples to ranking or interaction loss.
     """
 
     def __init__(self, args):
@@ -35,25 +34,50 @@ class UGRIMDCriterion(nn.Module):
         self.distill_lambda = float(getattr(args, "distill_lambda", 1.0))
         self.interaction_lambda = float(getattr(args, "interaction_lambda", 1.0))
         self.num_candidates = max(1, int(getattr(args, "num_candidates", 8)))
-        self.regenerate_steps = max(1, int(getattr(args, "candidate_regenerate_steps", 500)))
-        self.hard_sample_top_percent = min(100.0, max(0.0, float(getattr(args, "hard_sample_top_percent", 30.0))))
-        self.hard_sample_refresh_steps = max(1, int(getattr(args, "hard_sample_refresh_steps", 1000)))
-        self.exploration_percent = min(100.0, max(0.0, float(getattr(args, "exploration_percent", 10.0))))
+        self.regenerate_steps = max(
+            1, int(getattr(args, "candidate_regenerate_steps", 500))
+        )
+        self.candidate_max_new_tokens = max(
+            1, int(getattr(args, "candidate_max_new_tokens", 64))
+        )
+        self.hard_sample_top_percent = min(
+            100.0, max(0.0, float(getattr(args, "hard_sample_top_percent", 30.0)))
+        )
+        self.hard_sample_refresh_steps = max(
+            1, int(getattr(args, "hard_sample_refresh_steps", 1000))
+        )
+        self.exploration_percent = min(
+            100.0, max(0.0, float(getattr(args, "exploration_percent", 10.0)))
+        )
         self.rank_temperature = max(float(getattr(args, "rank_temperature", 0.1)), 1e-6)
         self.rank_epsilon = max(float(getattr(args, "rank_epsilon", 1e-8)), 1e-12)
-        self.visual_attention_layers = tuple(int(layer) for layer in getattr(args, "visual_attention_layers", [1, 2, 3]))
-        self.visual_weight_temperature = max(float(getattr(args, "visual_weight_temperature", 0.1)), 1e-6)
-        self.visual_weight_floor = min(1.0, max(0.0, float(getattr(args, "visual_weight_floor", 0.25))))
-        self.candidate_temperature = max(float(getattr(args, "candidate_temperature", 1.0)), 1e-6)
-        self.interaction_temperature = max(float(getattr(args, "interaction_temperature", 1.0)), 1e-6)
-        self.strength_temperature = max(float(getattr(args, "interaction_strength_temperature", 0.1)), 1e-6)
+        self.visual_attention_layers = tuple(
+            int(layer) for layer in getattr(args, "visual_attention_layers", [1, 2, 3])
+        )
+        self.visual_weight_temperature = max(
+            float(getattr(args, "visual_weight_temperature", 0.1)), 1e-6
+        )
+        self.visual_weight_floor = min(
+            1.0, max(0.0, float(getattr(args, "visual_weight_floor", 0.25)))
+        )
+        self.candidate_temperature = max(
+            float(getattr(args, "candidate_temperature", 1.0)), 1e-6
+        )
+        self.interaction_temperature = max(
+            float(getattr(args, "interaction_temperature", 1.0)), 1e-6
+        )
+        self.strength_temperature = max(
+            float(getattr(args, "interaction_strength_temperature", 0.1)), 1e-6
+        )
         self.loss_epsilon = max(float(getattr(args, "loss_epsilon", 1e-8)), 1e-12)
         self.global_step = 0
-        self._last_regeneration_step = None
         self.candidate_cache: Dict[str, List[str]] = {}
+        self.candidate_versions: Dict[str, int] = {}
         self.teacher_candidate_cache: Dict[str, Dict[str, torch.Tensor]] = {}
         self.hard_sample_cache: Dict[str, bool] = {}
-        self._last_hard_refresh_step = None
+        self.hard_sample_versions: Dict[str, int] = {}
+        self.teacher_cache_hits = 0
+        self.teacher_cache_misses = 0
 
     def set_global_step(self, global_step: int) -> None:
         self.global_step = int(global_step)
@@ -63,41 +87,77 @@ class UGRIMDCriterion(nn.Module):
         for message in reversed(messages):
             if message.get("role") == "assistant":
                 return "".join(
-                    part.get("text", "") for part in message.get("content", []) if part.get("type") == "text"
+                    part.get("text", "")
+                    for part in message.get("content", [])
+                    if part.get("type") == "text"
                 ).strip()
-        raise ValueError("UGRIMD requires an assistant answer in every training conversation.")
+        raise ValueError(
+            "UGRIMD requires an assistant answer in every training conversation."
+        )
 
     @staticmethod
-    def _with_candidate(messages: Sequence[Dict[str, Any]], candidate: str, language_only: bool) -> List[Dict[str, Any]]:
+    def _with_candidate(
+        messages: Sequence[Dict[str, Any]], candidate: str, language_only: bool
+    ) -> List[Dict[str, Any]]:
         result = copy.deepcopy(list(messages))
-        assistant_index = next((i for i in range(len(result) - 1, -1, -1) if result[i].get("role") == "assistant"), None)
+        assistant_index = next(
+            (
+                i
+                for i in range(len(result) - 1, -1, -1)
+                if result[i].get("role") == "assistant"
+            ),
+            None,
+        )
         if assistant_index is None:
-            raise ValueError("UGRIMD requires an assistant answer in every training conversation.")
+            raise ValueError(
+                "UGRIMD requires an assistant answer in every training conversation."
+            )
         result[assistant_index]["content"] = [{"type": "text", "text": candidate}]
         if language_only:
             for message in result:
-                message["content"] = [part for part in message.get("content", []) if part.get("type") != "image"]
+                message["content"] = [
+                    part
+                    for part in message.get("content", [])
+                    if part.get("type") != "image"
+                ]
         return result
 
     @staticmethod
     def _prompt(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prompt = copy.deepcopy(list(messages))
-        assistant_index = next((i for i in range(len(prompt) - 1, -1, -1) if prompt[i].get("role") == "assistant"), None)
+        assistant_index = next(
+            (
+                i
+                for i in range(len(prompt) - 1, -1, -1)
+                if prompt[i].get("role") == "assistant"
+            ),
+            None,
+        )
         if assistant_index is None:
-            raise ValueError("UGRIMD requires an assistant answer in every training conversation.")
+            raise ValueError(
+                "UGRIMD requires an assistant answer in every training conversation."
+            )
         return prompt[:assistant_index]
 
     @staticmethod
-    def _processor_inputs(processor, conversations: Sequence[Sequence[Dict[str, Any]]]) -> Dict[str, Any]:
+    def _processor_inputs(
+        processor, conversations: Sequence[Sequence[Dict[str, Any]]]
+    ) -> Dict[str, Any]:
         inputs = processor.apply_chat_template(
-            list(conversations), tokenize=True, add_generation_prompt=False,
-            return_dict=True, return_tensors="pt", padding=True,
+            list(conversations),
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
         )
         for key in ("input_ids", "attention_mask"):
             if key in inputs and torch.is_tensor(inputs[key]):
                 inputs[key] = inputs[key].long()
         tokenizer = getattr(processor, "tokenizer", processor)
-        inputs["labels"] = _make_labels_chatml(inputs["input_ids"], tokenizer, inputs.get("attention_mask"))
+        inputs["labels"] = _make_labels_chatml(
+            inputs["input_ids"], tokenizer, inputs.get("attention_mask")
+        )
         return inputs
 
     @staticmethod
@@ -107,7 +167,10 @@ class UGRIMDCriterion(nn.Module):
             device = next(model.parameters()).device
         except StopIteration:
             return inputs
-        return {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
+        return {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in inputs.items()
+        }
 
     @staticmethod
     def _log_likelihood(outputs, labels: torch.Tensor) -> torch.Tensor:
@@ -115,44 +178,72 @@ class UGRIMDCriterion(nn.Module):
         targets = labels[:, 1:]
         valid = targets.ne(IGNORE_INDEX)
         safe_targets = targets.masked_fill(~valid, 0)
-        log_probs = F.log_softmax(logits, dim=-1).gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+        log_probs = (
+            F.log_softmax(logits, dim=-1)
+            .gather(-1, safe_targets.unsqueeze(-1))
+            .squeeze(-1)
+        )
         return (log_probs * valid).sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)
 
-    def _generate_candidates(self, distiller: Any, messages: Sequence[Dict[str, Any]], answer: str) -> List[str]:
+    def _generate_candidates(
+        self, distiller: Any, messages: Sequence[Dict[str, Any]], answer: str
+    ) -> List[str]:
         if self.num_candidates == 1:
             return [answer]
         processor = distiller.get_student_processor()
         prompt_inputs = processor.apply_chat_template(
-            [self._prompt(messages)] * (self.num_candidates - 1), tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt", padding=True,
+            [self._prompt(messages)] * (self.num_candidates - 1),
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
         )
         prompt_inputs = self._to_model_device(prompt_inputs, distiller.student)
         with torch.no_grad():
-            generated = distiller.student.generate(**prompt_inputs, max_new_tokens=64, do_sample=True)
+            generated = distiller.student.generate(
+                **prompt_inputs,
+                max_new_tokens=self.candidate_max_new_tokens,
+                do_sample=True,
+            )
         prompt_len = prompt_inputs["input_ids"].shape[1]
         tokenizer = getattr(processor, "tokenizer", processor)
-        decoded = tokenizer.batch_decode(generated[:, prompt_len:], skip_special_tokens=True)
+        decoded = tokenizer.batch_decode(
+            generated[:, prompt_len:], skip_special_tokens=True
+        )
         # Preserve K candidate slots even when generation repeats or is empty;
         # the answer remains candidate 0 as required.
-        return [answer] + [(text.strip() or answer) for text in decoded[: self.num_candidates - 1]] + [answer] * max(0, self.num_candidates - 1 - len(decoded))
-
-    def _candidates(self, distiller: Any, ids: Sequence[Any], messages: Sequence[Sequence[Dict[str, Any]]]) -> List[List[str]]:
-        regenerate = (
-            self.global_step % self.regenerate_steps == 0
-            and self._last_regeneration_step != self.global_step
+        return (
+            [answer]
+            + [(text.strip() or answer) for text in decoded[: self.num_candidates - 1]]
+            + [answer] * max(0, self.num_candidates - 1 - len(decoded))
         )
+
+    def _candidates(
+        self,
+        distiller: Any,
+        ids: Sequence[Any],
+        messages: Sequence[Sequence[Dict[str, Any]]],
+    ) -> List[List[str]]:
+        version = self.global_step // self.regenerate_steps
         candidates = []
         for index, (sample_id, sample_messages) in enumerate(zip(ids, messages)):
             key = str(sample_id if sample_id is not None else f"batch-{index}")
-            if regenerate or key not in self.candidate_cache:
-                self.candidate_cache[key] = self._generate_candidates(distiller, sample_messages, self._answer(sample_messages))
+            if (
+                key not in self.candidate_cache
+                or self.candidate_versions.get(key) != version
+            ):
+                self.candidate_cache[key] = self._generate_candidates(
+                    distiller, sample_messages, self._answer(sample_messages)
+                )
+                self.candidate_versions[key] = version
                 self.teacher_candidate_cache.pop(key, None)
             candidates.append(self.candidate_cache[key])
-        if regenerate:
-            self._last_regeneration_step = self.global_step
         return candidates
 
-    def _hard_sample_mask(self, ids: Sequence[Any], student_vl: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _hard_sample_mask(
+        self, ids: Sequence[Any], student_vl: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Select difficult samples from detached student candidate entropy.
 
         Selection is deliberately discrete and cached by sample id: student
@@ -162,68 +253,83 @@ class UGRIMDCriterion(nn.Module):
         retain that decision until the next refresh.
         """
         candidate_count = student_vl.shape[-1]
-        student_probs = torch.softmax(student_vl.detach() / self.candidate_temperature, dim=-1)
-        uncertainty = -(student_probs * (student_probs + self.loss_epsilon).log()).sum(dim=-1)
-        uncertainty = uncertainty / math.log(max(candidate_count, 2))
-        refresh = (
-            self.global_step % self.hard_sample_refresh_steps == 0
-            and self._last_hard_refresh_step != self.global_step
+        student_probs = torch.softmax(
+            student_vl.detach() / self.candidate_temperature, dim=-1
         )
-        keys = [str(sample_id if sample_id is not None else f"batch-{index}") for index, sample_id in enumerate(ids)]
-        update_indices = [index for index, key in enumerate(keys) if refresh or key not in self.hard_sample_cache]
+        uncertainty = -(student_probs * (student_probs + self.loss_epsilon).log()).sum(
+            dim=-1
+        )
+        uncertainty = uncertainty / math.log(max(candidate_count, 2))
+        version = self.global_step // self.hard_sample_refresh_steps
+        keys = [
+            str(sample_id if sample_id is not None else f"batch-{index}")
+            for index, sample_id in enumerate(ids)
+        ]
+        update_indices = [
+            index
+            for index, key in enumerate(keys)
+            if key not in self.hard_sample_cache
+            or self.hard_sample_versions.get(key) != version
+        ]
         if update_indices:
-            update_tensor = torch.tensor(update_indices, device=uncertainty.device, dtype=torch.long)
+            update_tensor = torch.tensor(
+                update_indices, device=uncertainty.device, dtype=torch.long
+            )
             update_uncertainty = uncertainty.index_select(0, update_tensor)
             selected = self._top_mask(update_uncertainty, self.hard_sample_top_percent)
-            # Random exploration is sampled uniformly from the full refresh set;
-            # overlap with the hard subset is allowed, matching set-union mining.
+            remaining = (~selected).nonzero(as_tuple=False).flatten()
             explore_count = min(
-                update_uncertainty.numel(),
-                math.ceil(update_uncertainty.numel() * self.exploration_percent / 100.0),
+                remaining.numel(),
+                math.ceil(remaining.numel() * self.exploration_percent / 100.0),
             )
             if explore_count:
-                random_indices = torch.randperm(
-                    update_uncertainty.numel(), device=update_uncertainty.device
-                )[:explore_count]
-                selected[random_indices] = True
+                selected[
+                    remaining[
+                        torch.randperm(remaining.numel(), device=remaining.device)[
+                            :explore_count
+                        ]
+                    ]
+                ] = True
             for local_index, batch_index in enumerate(update_indices):
-                self.hard_sample_cache[keys[batch_index]] = bool(selected[local_index].item())
-        if refresh:
-            self._last_hard_refresh_step = self.global_step
-        mask = torch.tensor([self.hard_sample_cache[key] for key in keys], device=student_vl.device, dtype=torch.bool)
+                key = keys[batch_index]
+                self.hard_sample_cache[key] = bool(selected[local_index].item())
+                self.hard_sample_versions[key] = version
+        mask = torch.tensor(
+            [self.hard_sample_cache[key] for key in keys],
+            device=student_vl.device,
+            dtype=torch.bool,
+        )
         return mask, uncertainty
 
-    def _scores(self, model, processor, messages, candidates, language_only: bool, requires_grad: bool) -> torch.Tensor:
+    def _scores(
+        self,
+        model,
+        processor,
+        messages,
+        candidates,
+        language_only: bool,
+        requires_grad: bool,
+        return_grounding: bool = False,
+    ):
         flat_messages = [
             self._with_candidate(sample, candidate, language_only)
             for sample, sample_candidates in zip(messages, candidates)
             for candidate in sample_candidates
         ]
-        inputs = self._to_model_device(self._processor_inputs(processor, flat_messages), model)
+        inputs = self._processor_inputs(processor, flat_messages)
+        inputs = self._to_model_device(inputs, model)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         with context:
-            scores = self._log_likelihood(model(**inputs), inputs["labels"])
-        return scores.reshape(len(candidates), self.num_candidates)
-
-    def _student_vl_scores_and_grounding(self, model, processor, messages, candidates):
-        """Score visual-language candidates and estimate detached visual grounding."""
-        flat_messages = [
-            self._with_candidate(sample, candidate, language_only=False)
-            for sample, sample_candidates in zip(messages, candidates)
-            for candidate in sample_candidates
-        ]
-        inputs = self._to_model_device(self._processor_inputs(processor, flat_messages), model)
-        try:
-            outputs = model(**inputs, output_attentions=True)
-        except TypeError:
-            # Some remote-code VLMs do not expose output_attentions as a forward argument.
             outputs = model(**inputs)
-        scores = self._log_likelihood(outputs, inputs["labels"])
-        grounding = self._visual_grounding(outputs, inputs["labels"])
-        shape = (len(candidates), self.num_candidates)
-        return scores.reshape(shape), grounding.reshape(shape)
+            scores = self._log_likelihood(outputs, inputs["labels"])
+            if return_grounding:
+                grounding = self._visual_grounding(outputs, inputs["labels"])
+        scores = scores.reshape(len(candidates), self.num_candidates)
+        if return_grounding:
+            return scores, grounding.reshape(len(candidates), self.num_candidates)
+        return scores
 
-    def _visual_grounding(self, teacher_outputs, labels: torch.Tensor) -> torch.Tensor:
+    def _visual_grounding(self, model_outputs, labels: torch.Tensor) -> torch.Tensor:
         """Return detached response-to-vision attention ratios per candidate.
 
         Each requested layer contributes the mean-over-heads attention from
@@ -231,8 +337,8 @@ class UGRIMDCriterion(nn.Module):
         cannot provide a compatible attention/mask safely fall back to zero,
         making the configured floor the only visual reliability contribution.
         """
-        vision_mask = getattr(teacher_outputs, "vision_feature_mask", None)
-        attentions = getattr(teacher_outputs, "attentions", None)
+        vision_mask = getattr(model_outputs, "vision_feature_mask", None)
+        attentions = getattr(model_outputs, "attentions", None)
         result = labels.new_zeros(labels.shape[0], dtype=torch.float32)
         if vision_mask is None or attentions is None:
             return result
@@ -246,52 +352,85 @@ class UGRIMDCriterion(nn.Module):
                 continue
             if attention is None or attention.ndim != 4:
                 continue
-            sequence_length = min(attention.shape[-2], attention.shape[-1], labels.shape[1], vision_mask.shape[1])
+            sequence_length = min(
+                attention.shape[-2],
+                attention.shape[-1],
+                labels.shape[1],
+                vision_mask.shape[1],
+            )
             if sequence_length == 0:
                 continue
-            attention = attention[:, :, :sequence_length, :sequence_length].float().mean(dim=1)
+            attention = (
+                attention[:, :, :sequence_length, :sequence_length].float().mean(dim=1)
+            )
             response_mask = labels[:, :sequence_length].ne(IGNORE_INDEX)
-            vision_keys = vision_mask[:, :sequence_length].to(device=attention.device, dtype=attention.dtype)
+            vision_keys = vision_mask[:, :sequence_length].to(
+                device=attention.device, dtype=attention.dtype
+            )
             vision_attention = (attention * vision_keys[:, None, :]).sum(dim=-1)
-            attention_ratio = vision_attention / (attention.sum(dim=-1) + self.loss_epsilon)
+            attention_ratio = vision_attention / (
+                attention.sum(dim=-1) + self.loss_epsilon
+            )
             layer_ratios.append(
-                (attention_ratio * response_mask.to(dtype=attention_ratio.dtype)).sum(dim=-1)
+                (attention_ratio * response_mask.to(dtype=attention_ratio.dtype)).sum(
+                    dim=-1
+                )
                 / response_mask.sum(dim=-1).clamp_min(1)
             )
         if not layer_ratios:
             return result
         return torch.stack(layer_ratios, dim=0).mean(dim=0).detach()
 
-    def _teacher_vl_scores_and_grounding(self, model, processor, messages, candidates) -> tuple[torch.Tensor, torch.Tensor]:
+    def _teacher_vl_scores_and_grounding(
+        self, model, processor, messages, candidates
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat_messages = [
             self._with_candidate(sample, candidate, language_only=False)
             for sample, sample_candidates in zip(messages, candidates)
             for candidate in sample_candidates
         ]
-        inputs = self._to_model_device(self._processor_inputs(processor, flat_messages), model)
+        inputs = self._to_model_device(
+            self._processor_inputs(processor, flat_messages), model
+        )
         with torch.no_grad():
-            try:
-                outputs = model(**inputs, output_attentions=True)
-            except TypeError:
-                # Some remote-code VLMs do not expose output_attentions as a forward argument.
-                outputs = model(**inputs)
+            outputs = model(**inputs)
             scores = self._log_likelihood(outputs, inputs["labels"])
             grounding = self._visual_grounding(outputs, inputs["labels"])
-        return scores.reshape(len(candidates), self.num_candidates), grounding.reshape(len(candidates), self.num_candidates)
+        return scores.reshape(len(candidates), self.num_candidates), grounding.reshape(
+            len(candidates), self.num_candidates
+        )
 
-    def _cached_teacher_scores(self, distiller: Any, ids, messages, candidates, student_device: torch.device):
+    def _cached_teacher_scores(
+        self, distiller: Any, ids, messages, candidates, student_device: torch.device
+    ):
         """Cache detached teacher candidate scores and visual grounding by id."""
-        keys = [str(sample_id if sample_id is not None else f"batch-{index}") for index, sample_id in enumerate(ids)]
-        missing = [index for index, key in enumerate(keys) if key not in self.teacher_candidate_cache]
+        keys = [
+            str(sample_id if sample_id is not None else f"batch-{index}")
+            for index, sample_id in enumerate(ids)
+        ]
+        missing = [
+            index
+            for index, key in enumerate(keys)
+            if key not in self.teacher_candidate_cache
+        ]
+        self.teacher_cache_misses += len(missing)
+        self.teacher_cache_hits += len(keys) - len(missing)
         if missing:
             missing_messages = [messages[index] for index in missing]
             missing_candidates = [candidates[index] for index in missing]
             vl_scores, grounding = self._teacher_vl_scores_and_grounding(
-                distiller.teacher, distiller.get_teacher_processor(), missing_messages, missing_candidates
+                distiller.teacher,
+                distiller.get_teacher_processor(),
+                missing_messages,
+                missing_candidates,
             )
             l_scores = self._scores(
-                distiller.teacher, distiller.get_teacher_processor(), missing_messages, missing_candidates,
-                language_only=True, requires_grad=False,
+                distiller.teacher,
+                distiller.get_teacher_processor(),
+                missing_messages,
+                missing_candidates,
+                language_only=True,
+                requires_grad=False,
             )
             for row, index in enumerate(missing):
                 self.teacher_candidate_cache[keys[index]] = {
@@ -300,16 +439,21 @@ class UGRIMDCriterion(nn.Module):
                     "grounding": grounding[row].detach().cpu(),
                 }
         return tuple(
-            torch.stack([self.teacher_candidate_cache[key][name] for key in keys]).to(student_device)
+            torch.stack([self.teacher_candidate_cache[key][name] for key in keys]).to(
+                student_device
+            )
             for name in ("vl_scores", "l_scores", "grounding")
         )
 
+    def _teacher_cache_hit_rate(self) -> float:
+        total = self.teacher_cache_hits + self.teacher_cache_misses
+        return self.teacher_cache_hits / total if total else 0.0
+
     @staticmethod
     def _binary_entropy(probability: torch.Tensor, eps: float) -> torch.Tensor:
-        probability = probability.clamp(min=eps, max=1.0 - eps)
-        complement = 1.0 - probability
         return -(
-            probability * probability.log() + complement * complement.log()
+            probability * (probability + eps).log()
+            + (1 - probability) * (1 - probability + eps).log()
         ) / math.log(2)
 
     @staticmethod
@@ -321,108 +465,104 @@ class UGRIMDCriterion(nn.Module):
         mask[values.topk(count).indices] = True
         return mask
 
-    def compute_score_losses(
+    def _visual_reliability(
         self,
-        teacher_vl: torch.Tensor,
-        student_vl: torch.Tensor,
-        teacher_l: torch.Tensor,
-        student_l: torch.Tensor,
         teacher_grounding: torch.Tensor,
         student_grounding: torch.Tensor,
-    ):
-        """Compute UGRIMD ranking and cross-condition interaction losses."""
-        eps = self.rank_epsilon
-        _, candidate_count = teacher_vl.shape
+        pair_i: torch.Tensor,
+        pair_j: torch.Tensor,
+    ) -> torch.Tensor:
+        teacher_visual_margin = (
+            teacher_grounding[:, pair_i] - teacher_grounding[:, pair_j]
+        )
+        student_visual_margin = (
+            student_grounding[:, pair_i] - student_grounding[:, pair_j]
+        )
+        visual_agreement = torch.sigmoid(
+            (teacher_visual_margin * student_visual_margin)
+            / self.visual_weight_temperature
+        )
+        return (
+            self.visual_weight_floor + (1 - self.visual_weight_floor) * visual_agreement
+        ).detach()
 
+    def compute_score_losses(
+        self,
+        teacher_vl,
+        student_vl,
+        teacher_l,
+        student_l,
+        teacher_grounding,
+        student_grounding,
+    ):
+        """Compute the two independent objectives from [B, K] candidate scores."""
+        eps = self.rank_epsilon
+        _bsz, candidate_count = teacher_vl.shape
+        pair_i, pair_j = torch.triu_indices(
+            candidate_count, candidate_count, offset=1, device=teacher_vl.device
+        )
+        teacher_margin = (teacher_vl[:, pair_i] - teacher_vl[:, pair_j]).detach()
+        student_margin = student_vl[:, pair_i] - student_vl[:, pair_j]
+        q_teacher = torch.sigmoid(teacher_margin / self.rank_temperature)
+        q_student = torch.sigmoid(student_margin / self.rank_temperature)
         teacher_probs_vl = torch.softmax(
             teacher_vl.detach() / self.candidate_temperature, dim=-1
         )
         teacher_uncertainty = -(
-            teacher_probs_vl * teacher_probs_vl.clamp_min(self.loss_epsilon).log()
-        ).sum(dim=-1) / math.log(max(candidate_count, 2))
-        teacher_uncertainty = teacher_uncertainty.clamp(0.0, 1.0)
-        teacher_certainty = 1.0 - teacher_uncertainty
-
-        # Pairwise preference probabilities and normalized binary entropies.
-        pair_i, pair_j = torch.triu_indices(
-            candidate_count, candidate_count, offset=1, device=teacher_vl.device
+            teacher_probs_vl * (teacher_probs_vl + self.loss_epsilon).log()
+        ).sum(dim=-1)
+        teacher_uncertainty = teacher_uncertainty / math.log(max(candidate_count, 2))
+        teacher_certainty = 1 - teacher_uncertainty
+        visual_reliability = self._visual_reliability(
+            teacher_grounding.detach(),
+            student_grounding.detach(),
+            pair_i,
+            pair_j,
         )
-        teacher_margin = (
-            teacher_vl[:, pair_i] - teacher_vl[:, pair_j]
-        ).detach()
-        student_margin = student_vl[:, pair_i] - student_vl[:, pair_j]
-        q_teacher = torch.sigmoid(teacher_margin / self.rank_temperature)
-        q_student = torch.sigmoid(student_margin / self.rank_temperature)
-        teacher_pair_uncertainty = self._binary_entropy(q_teacher, eps).clamp(0.0, 1.0)
-        student_pair_uncertainty = self._binary_entropy(q_student, eps).clamp(0.0, 1.0)
-
-        # Visual agreement compares teacher and student grounding *differences*.
-        teacher_visual_margin = (
-            teacher_grounding[:, pair_i] - teacher_grounding[:, pair_j]
-        ).detach()
-        student_visual_margin = (
-            student_grounding[:, pair_i] - student_grounding[:, pair_j]
-        ).detach()
-        grounding_delta = teacher_visual_margin * student_visual_margin
-        visual_agreement = torch.sigmoid(
-            grounding_delta / self.visual_weight_temperature
-        ).detach()
-        visual_reliability = (
-            self.visual_weight_floor
-            + (1.0 - self.visual_weight_floor) * visual_agreement
-        ).detach()
-
-        # Pair gate excludes example-level certainty; that is applied only after
-        # the weighted pair losses have been normalized within each example.
+        # Pair supervision combines teacher confidence, student uncertainty,
+        # and bounded visual agreement. Sample certainty is applied only after
+        # within-example normalization.
         rank_gate = (
-            (1.0 - teacher_pair_uncertainty)
-            * student_pair_uncertainty
+            (1 - self._binary_entropy(q_teacher, eps))
+            * self._binary_entropy(q_student, eps)
             * visual_reliability
-        ).detach()
-        rank_bce = -(
-            q_teacher * q_student.clamp_min(eps).log()
-            + (1.0 - q_teacher) * (1.0 - q_student).clamp_min(eps).log()
         )
-        pair_weight_sum = rank_gate.sum(dim=-1)
-        weighted_pair_loss = (rank_gate * rank_bce).sum(dim=-1)
-        rank_per_sample = torch.where(
-            pair_weight_sum > 0,
-            weighted_pair_loss / pair_weight_sum.clamp_min(self.loss_epsilon),
-            torch.zeros_like(weighted_pair_loss),
+        rank_bce = -(
+            q_teacher * (q_student + eps).log()
+            + (1 - q_teacher) * (1 - q_student + eps).log()
+        )
+        rank_per_sample = (rank_gate * rank_bce).sum(dim=-1) / (
+            rank_gate.sum(dim=-1) + self.loss_epsilon
         )
         rank_loss = (teacher_certainty * rank_per_sample).mean()
 
-        # Cross-condition probability shifts, weighted by teacher uncertainty
-        # and the bounded magnitude of the teacher's response to visual input.
+        p_teacher_vl = teacher_probs_vl
         p_teacher_l = torch.softmax(
             teacher_l.detach() / self.candidate_temperature, dim=-1
         )
-        p_student_vl = torch.softmax(
-            student_vl / self.candidate_temperature, dim=-1
-        )
-        p_student_l = torch.softmax(
-            student_l / self.candidate_temperature, dim=-1
-        )
-        teacher_shift = (teacher_probs_vl - p_teacher_l).detach()
+        p_student_vl = torch.softmax(student_vl / self.candidate_temperature, dim=-1)
+        p_student_l = torch.softmax(student_l / self.candidate_temperature, dim=-1)
+        teacher_shift = (p_teacher_vl - p_teacher_l).detach()
         student_shift = p_student_vl - p_student_l
         strength = 0.5 * teacher_shift.abs().sum(dim=-1)
-        normalized_strength = strength / (strength + self.strength_temperature)
-        interaction_gate = (teacher_uncertainty * normalized_strength).detach()
+        # Teacher uncertainty chooses interaction; student uncertainty has
+        # already selected this sample and is not used as a loss weight.
+        interaction_gate = (
+            teacher_uncertainty * strength / (strength + self.strength_temperature)
+        )
         interaction_per_sample = F.smooth_l1_loss(
             student_shift,
             teacher_shift,
             reduction="none",
             beta=self.interaction_temperature,
         ).mean(dim=-1)
-        # The paper defines a weighted batch mean, not normalization by total gate mass.
-        interaction_loss = (interaction_gate * interaction_per_sample).mean()
-
+        interaction_loss = (interaction_per_sample * interaction_gate).mean()
         return (
             rank_loss,
             interaction_loss,
             teacher_uncertainty.mean(),
             interaction_gate.sum(),
-            visual_reliability.mean() if visual_reliability.numel() else teacher_vl.new_zeros(()),
+            visual_reliability.mean(),
         )
 
     def forward(self, distiller: Any, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -432,32 +572,87 @@ class UGRIMDCriterion(nn.Module):
             raise RuntimeError("Student model did not return supervised CE loss.")
         messages = batch.get("candidate_messages")
         if messages is None:
-            raise RuntimeError("UGRIMD requires candidate_messages from VlmDistillDataCollator.")
+            raise RuntimeError(
+                "UGRIMD requires candidate_messages from VlmDistillDataCollator."
+            )
         candidates = self._candidates(distiller, batch["ids"], messages)
         student_processor = distiller.get_student_processor()
-        student_vl_all, student_grounding_all = self._student_vl_scores_and_grounding(
-            distiller.student, student_processor, messages, candidates
+        student_vl, student_grounding = self._scores(
+            distiller.student,
+            student_processor,
+            messages,
+            candidates,
+            language_only=False,
+            requires_grad=True,
+            return_grounding=True,
         )
-        hard_mask, student_uncertainty = self._hard_sample_mask(batch["ids"], student_vl_all)
+        hard_mask, student_uncertainty = self._hard_sample_mask(
+            batch["ids"], student_vl
+        )
         hard_indices = hard_mask.nonzero(as_tuple=False).flatten()
         if hard_indices.numel() == 0:
             zero = ce_loss.new_zeros(())
-            return {"loss": ce_loss, "supervised_loss": ce_loss.detach(), "rank_loss": zero, "interaction_loss": zero, "visual_ranking_weight": zero, "student_uncertainty": student_uncertainty.mean().detach(), "teacher_uncertainty": zero, "hard_sample_count": zero, "active_interaction_samples": zero}
+            return {
+                "loss": ce_loss,
+                "supervised_loss": ce_loss.detach(),
+                "rank_loss": zero,
+                "interaction_loss": zero,
+                "visual_ranking_weight": zero,
+                "student_uncertainty": student_uncertainty.mean().detach(),
+                "teacher_uncertainty": zero,
+                "hard_sample_count": zero,
+                "active_interaction_samples": zero,
+                "teacher_cache_hit_rate": zero,
+            }
         selected_indices = hard_indices.tolist()
         selected_messages = [messages[index] for index in selected_indices]
         selected_candidates = [candidates[index] for index in selected_indices]
         selected_ids = [batch["ids"][index] for index in selected_indices]
-        student_vl = student_vl_all.index_select(0, hard_indices)
-        student_grounding = student_grounding_all.index_select(0, hard_indices)
+        student_vl = student_vl.index_select(0, hard_indices)
+        student_grounding = student_grounding.index_select(0, hard_indices)
         student_l = self._scores(
-            distiller.student, student_processor, selected_messages, selected_candidates,
-            language_only=True, requires_grad=True,
+            distiller.student,
+            student_processor,
+            selected_messages,
+            selected_candidates,
+            True,
+            True,
         )
         teacher_vl, teacher_l, teacher_grounding = self._cached_teacher_scores(
-            distiller, selected_ids, selected_messages, selected_candidates, student_vl.device
+            distiller,
+            selected_ids,
+            selected_messages,
+            selected_candidates,
+            student_vl.device,
         )
-        rank_loss, interaction_loss, teacher_uncertainty, active_interaction, visual_reliability = self.compute_score_losses(
-            teacher_vl, student_vl, teacher_l, student_l, teacher_grounding, student_grounding
+        (
+            rank_loss,
+            interaction_loss,
+            teacher_uncertainty,
+            active_interaction,
+            visual_reliability,
+        ) = self.compute_score_losses(
+            teacher_vl,
+            student_vl,
+            teacher_l,
+            student_l,
+            teacher_grounding,
+            student_grounding,
         )
-        total = ce_loss + self.distill_lambda * (rank_loss + self.interaction_lambda * interaction_loss)
-        return {"loss": total, "supervised_loss": ce_loss.detach(), "rank_loss": rank_loss.detach(), "interaction_loss": interaction_loss.detach(), "visual_ranking_weight": visual_reliability.detach(), "student_uncertainty": student_uncertainty.mean().detach(), "teacher_uncertainty": teacher_uncertainty.detach(), "hard_sample_count": hard_mask.sum().detach(), "active_interaction_samples": active_interaction.detach()}
+        total = ce_loss + self.distill_lambda * (
+            rank_loss + self.interaction_lambda * interaction_loss
+        )
+        return {
+            "loss": total,
+            "supervised_loss": ce_loss.detach(),
+            "rank_loss": rank_loss.detach(),
+            "interaction_loss": interaction_loss.detach(),
+            "visual_ranking_weight": visual_reliability.detach(),
+            "student_uncertainty": student_uncertainty.mean().detach(),
+            "teacher_uncertainty": teacher_uncertainty.detach(),
+            "hard_sample_count": hard_mask.sum().detach(),
+            "active_interaction_samples": active_interaction.detach(),
+            "teacher_cache_hit_rate": teacher_vl.new_tensor(
+                self._teacher_cache_hit_rate()
+            ),
+        }

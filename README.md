@@ -21,7 +21,7 @@ This repository is used to fine-tune and distill Vision-Language Models (VLMs) w
 | `.env.example` | Example environment variables for WandB and Hugging Face Hub. |
 | `config/` | Projector configs for specific KD methods, such as `dskd_v2_projectors.json`, `dwa_kd_projectors.json`, and `mcw_kd_projectors.json`. |
 | `configs/` | Runtime configs, including DeepSpeed ZeRO-2 and evaluation configs. |
-| `docs/` | Technical notes and plans, for example the unit-aligned distillation training plan. |
+| `docs/` | Technical notes and method documentation, including the unit-aligned distillation document. |
 | `experiments/` | Experiment tracking files, such as `experiment_tracker.xlsx`. |
 | `outputs/` | Runtime-generated training/evaluation artifacts: checkpoints, projectors, logs, and results. This is not core source code. |
 | `script_train/` | Shell training recipes grouped by method and model pair. This is the easiest place to start when running experiments. |
@@ -56,7 +56,7 @@ This repository is used to fine-tune and distill Vision-Language Models (VLMs) w
 | `unit_aligned.py` | Joint SRE + EM-KD criterion for unit-aligned distillation. |
 | `scva.py` | SCVA: semantic-cluster visual attention loss for vision tokens. |
 | `cgkd.py` | CGKD: confidence-gated generative KD. |
-| `ugrimd.py` | UGRIMD: uncertainty-gated within-sample candidate ranking plus multimodal interaction distillation. |
+| `ugrimd.py` | UGRIMD: student-uncertainty mining, visually reliable within-sample ranking, and cross-condition interaction distillation. |
 | `scva_cgkd.py` | Joint SCVA + CGKD criterion. Also available through the `draft` alias. |
 | `dwa_kd.py` | DWA-KD with KL, hidden/logit losses, SoftDTW, and projectors. |
 | `dskd_v2.py` | DSKD v2 with teacher-to-student/student-to-teacher projectors and top-k vocabulary config. |
@@ -86,6 +86,65 @@ Mapped `--kd_loss_type` values include: `ce_only`, `default`, `default_distillat
 | `script_train/_common.sh` | Shared helper for loading `.env`, enabling WandB, and setting Hugging Face Hub push flags when tokens are available. |
 
 For example, `script_train/dskd_v2/train_qwen3_teacher_4b_fastvlm_student_05b_dskd_v2_with_eta.sh` uses `FastVLM-0.5B` as the student and `Qwen3-VL-4B-Instruct` as the teacher. It uses `config/dskd_v2_projectors.json`, trains on `train_data/llava_v1_5_mix665k.json`, and writes outputs to `outputs/qwen3_teacher_4b_fastvlm_student_05b_dskd_v2_with_eta`.
+
+## UGRIMD CVPR Reproduction
+
+UGRIMD uses two consecutive stages. Stage 1 trains only with assistant-token cross-entropy. Stage 2 loads the Stage-1 LoRA checkpoint, keeps cross-entropy active, and adds ranking and interaction distillation. The Stage-2 scripts fail immediately when the matching Stage-1 checkpoint is absent, so the student is never silently reinitialized.
+
+### Model pairs
+
+| Pair | Teacher | Student | Stage 1 | Stage 2 |
+| --- | --- | --- | --- | --- |
+| A | `Qwen/Qwen3-VL-4B-Instruct` | `KamilaMila/FastVLM-0.5B` | `script_train/sft/train_fastvlm_0_5b_sft.sh` | `script_train/ugrimd/train_qwen3_teacher_4b_fastvlm_student_05b_ugrimd.sh` |
+| B | `Qwen/Qwen3-VL-8B-Instruct` | `Qwen/Qwen2.5-VL-3B-Instruct` | `script_train/sft/train_qwen25_vl_3b_sft.sh` | `script_train/ugrimd/train_qwen3_teacher_8b_qwen25_student_3b_ugrimd.sh` |
+| C | `Qwen/Qwen2.5-VL-7B-Instruct` | `Qwen/Qwen2-VL-2B-Instruct` | `script_train/sft/train_qwen2_vl_2b_sft.sh` | `script_train/ugrimd/train_qwen25_teacher_7b_qwen2_student_2b_ugrimd.sh` |
+
+### Repeated runs
+
+The commands below use three isolated seeds and seed-specific output directories:
+
+```bash
+for seed in 1337 2025 3407; do
+  SEED="${seed}" bash script_train/sft/train_fastvlm_0_5b_sft.sh
+  SEED="${seed}" bash script_train/ugrimd/train_qwen3_teacher_4b_fastvlm_student_05b_ugrimd.sh
+done
+
+for seed in 1337 2025 3407; do
+  SEED="${seed}" bash script_train/sft/train_qwen25_vl_3b_sft.sh
+  SEED="${seed}" bash script_train/ugrimd/train_qwen3_teacher_8b_qwen25_student_3b_ugrimd.sh
+done
+
+for seed in 1337 2025 3407; do
+  SEED="${seed}" bash script_train/sft/train_qwen2_vl_2b_sft.sh
+  SEED="${seed}" bash script_train/ugrimd/train_qwen25_teacher_7b_qwen2_student_2b_ugrimd.sh
+done
+```
+
+Stage 2 defaults to 20,000 optimizer steps, `K=8`, candidate regeneration every 500 steps, hard-set refresh every 1,000 steps, a 30% hard fraction, 10% exploration from the remaining examples, decoder-attention layers `[1,2,3]`, visual floor `0.25`, `distill_lambda=0.5`, and `interaction_lambda=0.7`. Every value can be overridden through the uppercase environment variable shown in the shell scripts.
+
+### Method-to-code correspondence
+
+* Candidate strings are independently tokenized and teacher-forced by each model; no vocabulary, token-position, hidden-state, or decoder-depth alignment is used.
+* Student VL entropy selects the hard examples. Candidate and hard-set refresh use separate per-sample version counters, so every sample refreshes when it first appears in a new interval.
+* Ranking forms pairs only within one sample. Pair weights combine teacher pair confidence, student pair uncertainty, and bounded teacher/student visual-grounding agreement. Teacher certainty is applied after within-sample pair normalization.
+* Interaction aligns the VL-minus-L candidate-distribution shifts. Its weight is teacher entropy multiplied by the bounded teacher shift magnitude, and the weighted losses are averaged over the selected examples.
+* Detached teacher VL scores, L-only scores, and visual-grounding values share one cache entry. Regenerating a sample's candidates invalidates its teacher entry. `teacher_cache_hit_rate` is emitted with the other training metrics.
+
+### Evaluation suite
+
+`configs/eval/cvpr_main.json` contains the eleven benchmarks used by the CVPR tables: GQA, RealWorldQA, MME, ChartQA, DocVQA, TextVQA, OCRBench, ScienceQA, AI2D, MMMU, and MMStar. Run each seed independently:
+
+```bash
+bash scripts/eval/run_eval.sh \
+  cvpr_main \
+  outputs/qwen3_teacher_8b_qwen25_student_3b_ugrimd_seed_1337/checkpoint-20000
+```
+
+Evaluation outputs are written below `outputs/eval/cvpr_main/`. Record the VLMEvalKit commit, generated evaluator configuration, checkpoint hash, seed, and native benchmark scale with every table row.
+
+### Result integrity
+
+Only evaluator-produced artifacts count as experimental results. Synthetic, illustrative, or manually projected scores must not appear as measured results in the paper. Means and standard deviations must be computed from the three seed-specific evaluator outputs, and every efficiency entry must come from synchronized end-to-end runs that include candidate refresh and teacher scoring.
 
 ## Training Data
 
@@ -118,7 +177,7 @@ The main training pipeline receives `--data_path` pointing to JSON or JSONL data
 | `scripts/eval/run_eval.sh` | Runs a VLMEvalKit suite for one checkpoint. It can auto-merge LoRA adapters before evaluation. |
 | `scripts/eval/merge_lora.py` | Merges a PEFT/LoRA adapter into the base model to produce a full Hugging Face checkpoint. |
 | `scripts/eval/run_all_methods.sh` | Runs evaluation across multiple methods/checkpoints. |
-| `configs/eval/*.json` | Dataset/judge definitions for evaluation suites: `fast_signal`, `main_table`, and `full`. |
+| `configs/eval/*.json` | Dataset/judge definitions for evaluation suites: `fast_signal`, `main_table`, `cvpr_main`, and `full`. |
 | `test_load_dataset.py` | Smoke test for dataset + collator with real processors. |
 | `test_loadmodel/*.py` | Load tests for individual backbone/model processors. |
 | `tests/test_kd_plumbing.py` | Small unit tests for criterion mapping and selected argument/collator behavior. |
@@ -142,6 +201,6 @@ python test_load_dataset.py \
 
 ## Quick Notes
 
-- Several training scripts hard-code `PROJECT_DIR=/workspace/ComfyUI/models/instantid/VLM_Distillation`; update that path or export the matching variable if the repo is moved.
+- The SFT and UGRIMD scripts derive `PROJECT_DIR` from the current directory and accept environment overrides for data, checkpoints, seeds, and run settings.
 - `outputs/`, `.venv/`, large datasets, and checkpoints are runtime artifacts, not core source code.
 - The teacher is frozen in `Distiller`; trainable parameters are mainly the student LoRA adapter and projectors when enabled.

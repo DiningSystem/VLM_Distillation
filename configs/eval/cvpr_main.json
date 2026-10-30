@@ -1,0 +1,32 @@
+{
+  "name": "cvpr_main",
+  "description": "Eleven-benchmark suite used for the UGRIMD CVPR main tables.",
+  "datasets": [
+    "GQA_TestDev_Balanced",
+    "RealWorldQA",
+    "MME",
+    "ChartQA_TEST",
+    "DocVQA_VAL",
+    "TextVQA_VAL",
+    "OCRBench",
+    "ScienceQA_TEST",
+    "AI2D_TEST_NO_MASK",
+    "MMMU_DEV_VAL",
+    "MMStar"
+  ],
+  "judge_model": null,
+  "judge_kwargs": {},
+  "native_scales": {
+    "GQA_TestDev_Balanced": "accuracy",
+    "RealWorldQA": "accuracy",
+    "MME": "perception score",
+    "ChartQA_TEST": "relaxed accuracy",
+    "DocVQA_VAL": "ANLS",
+    "TextVQA_VAL": "VQA accuracy",
+    "OCRBench": "OCRBench score",
+    "ScienceQA_TEST": "accuracy",
+    "AI2D_TEST_NO_MASK": "accuracy",
+    "MMMU_DEV_VAL": "accuracy",
+    "MMStar": "accuracy"
+  }
+}
