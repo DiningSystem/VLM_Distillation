@@ -4,7 +4,8 @@
 # Usage:
 #   bash scripts/eval/run_eval.sh <suite> <ckpt_path> [model_name]
 #
-#   <suite>          : fast_signal | main_table | full  (matches configs/eval/<suite>.json)
+#   <suite>          : fast_signal | main_table | cvpr_main | full
+#                      (matches configs/eval/<suite>.json)
 #   <ckpt_path>      : path to a saved student checkpoint dir (DistillTrainer._save layout)
 #   <model_name>     : name used inside VLMEvalKit outputs (default: checkpoint basename).
 #

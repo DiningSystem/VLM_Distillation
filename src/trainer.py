@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Metadata keys that should never be forwarded to the model.
 _BATCH_METADATA_KEYS = frozenset(
-    {"ids", "image_paths", "texts", "images", "global_dataset_name", "dataset_name"}
+    {"ids", "image_paths", "texts", "images", "candidate_messages", "global_dataset_name", "dataset_name"}
 )
 
 
@@ -106,6 +106,10 @@ class DistillTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if self._is_distillation:
+            if hasattr(self.criterion, "set_global_step"):
+                # ``state.global_step`` counts optimizer updates (rather than
+                # micro-batches), which is exactly the candidate-cache cadence.
+                self.criterion.set_global_step(self.state.global_step)
             # The criterion receives the full batch, which includes
             # student_inputs["labels"] for assistant-position gating.
             loss_output = model(self.criterion, inputs)

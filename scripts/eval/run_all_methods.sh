@@ -6,7 +6,7 @@
 # Usage:
 #   bash scripts/eval/run_all_methods.sh <suite> [pattern]
 #
-#   <suite>    : fast_signal | main_table | full
+#   <suite>    : fast_signal | main_table | cvpr_main | full
 #   [pattern]  : glob under outputs/ (default "qwen25_teacher_7b_qwen2_student_2b_*")
 #
 # Env overrides:
