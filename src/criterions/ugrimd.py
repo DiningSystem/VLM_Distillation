@@ -24,9 +24,9 @@ IGNORE_INDEX = -100
 class UGRIMDCriterion(nn.Module):
     """Stage-2 CE plus hard-sample ranking and visual-shift matching.
 
-    Stage 1 is the repository's normal SFT path.  Stage 2 keeps CE active,
-    mines examples from student candidate entropy, then uses detached teacher
-    uncertainty to route selected examples to ranking or interaction loss.
+    Stage 1 is the repository's normal SFT path. Stage 2 keeps CE active,
+    mines uncertain student examples with random exploration, and combines
+    pair-normalized ranking with cross-condition probability-shift matching.
     """
 
     def __init__(self, args):
@@ -36,7 +36,6 @@ class UGRIMDCriterion(nn.Module):
         self.interaction_lambda = float(getattr(args, "interaction_lambda", 1.0))
         self.num_candidates = max(1, int(getattr(args, "num_candidates", 8)))
         self.regenerate_steps = max(1, int(getattr(args, "candidate_regenerate_steps", 500)))
-        self.pair_top_percent = min(100.0, max(0.0, float(getattr(args, "uncertainty_top_percent", 30.0))))
         self.hard_sample_top_percent = min(100.0, max(0.0, float(getattr(args, "hard_sample_top_percent", 30.0))))
         self.hard_sample_refresh_steps = max(1, int(getattr(args, "hard_sample_refresh_steps", 1000)))
         self.exploration_percent = min(100.0, max(0.0, float(getattr(args, "exploration_percent", 10.0))))
@@ -176,10 +175,17 @@ class UGRIMDCriterion(nn.Module):
             update_tensor = torch.tensor(update_indices, device=uncertainty.device, dtype=torch.long)
             update_uncertainty = uncertainty.index_select(0, update_tensor)
             selected = self._top_mask(update_uncertainty, self.hard_sample_top_percent)
-            remaining = (~selected).nonzero(as_tuple=False).flatten()
-            explore_count = min(remaining.numel(), math.ceil(remaining.numel() * self.exploration_percent / 100.0))
+            # Random exploration is sampled uniformly from the full refresh set;
+            # overlap with the hard subset is allowed, matching set-union mining.
+            explore_count = min(
+                update_uncertainty.numel(),
+                math.ceil(update_uncertainty.numel() * self.exploration_percent / 100.0),
+            )
             if explore_count:
-                selected[remaining[torch.randperm(remaining.numel(), device=remaining.device)[:explore_count]]] = True
+                random_indices = torch.randperm(
+                    update_uncertainty.numel(), device=update_uncertainty.device
+                )[:explore_count]
+                selected[random_indices] = True
             for local_index, batch_index in enumerate(update_indices):
                 self.hard_sample_cache[keys[batch_index]] = bool(selected[local_index].item())
         if refresh:
@@ -188,13 +194,34 @@ class UGRIMDCriterion(nn.Module):
         return mask, uncertainty
 
     def _scores(self, model, processor, messages, candidates, language_only: bool, requires_grad: bool) -> torch.Tensor:
-        flat_messages = [self._with_candidate(sample, candidate, language_only) for sample, sample_candidates in zip(messages, candidates) for candidate in sample_candidates]
-        inputs = self._processor_inputs(processor, flat_messages)
-        inputs = self._to_model_device(inputs, model)
+        flat_messages = [
+            self._with_candidate(sample, candidate, language_only)
+            for sample, sample_candidates in zip(messages, candidates)
+            for candidate in sample_candidates
+        ]
+        inputs = self._to_model_device(self._processor_inputs(processor, flat_messages), model)
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         with context:
             scores = self._log_likelihood(model(**inputs), inputs["labels"])
         return scores.reshape(len(candidates), self.num_candidates)
+
+    def _student_vl_scores_and_grounding(self, model, processor, messages, candidates):
+        """Score visual-language candidates and estimate detached visual grounding."""
+        flat_messages = [
+            self._with_candidate(sample, candidate, language_only=False)
+            for sample, sample_candidates in zip(messages, candidates)
+            for candidate in sample_candidates
+        ]
+        inputs = self._to_model_device(self._processor_inputs(processor, flat_messages), model)
+        try:
+            outputs = model(**inputs, output_attentions=True)
+        except TypeError:
+            # Some remote-code VLMs do not expose output_attentions as a forward argument.
+            outputs = model(**inputs)
+        scores = self._log_likelihood(outputs, inputs["labels"])
+        grounding = self._visual_grounding(outputs, inputs["labels"])
+        shape = (len(candidates), self.num_candidates)
+        return scores.reshape(shape), grounding.reshape(shape)
 
     def _visual_grounding(self, teacher_outputs, labels: torch.Tensor) -> torch.Tensor:
         """Return detached response-to-vision attention ratios per candidate.
@@ -243,7 +270,11 @@ class UGRIMDCriterion(nn.Module):
         ]
         inputs = self._to_model_device(self._processor_inputs(processor, flat_messages), model)
         with torch.no_grad():
-            outputs = model(**inputs)
+            try:
+                outputs = model(**inputs, output_attentions=True)
+            except TypeError:
+                # Some remote-code VLMs do not expose output_attentions as a forward argument.
+                outputs = model(**inputs)
             scores = self._log_likelihood(outputs, inputs["labels"])
             grounding = self._visual_grounding(outputs, inputs["labels"])
         return scores.reshape(len(candidates), self.num_candidates), grounding.reshape(len(candidates), self.num_candidates)
@@ -275,7 +306,11 @@ class UGRIMDCriterion(nn.Module):
 
     @staticmethod
     def _binary_entropy(probability: torch.Tensor, eps: float) -> torch.Tensor:
-        return -(probability * (probability + eps).log() + (1 - probability) * (1 - probability + eps).log()) / math.log(2)
+        probability = probability.clamp(min=eps, max=1.0 - eps)
+        complement = 1.0 - probability
+        return -(
+            probability * probability.log() + complement * complement.log()
+        ) / math.log(2)
 
     @staticmethod
     def _top_mask(values: torch.Tensor, percent: float) -> torch.Tensor:
@@ -286,55 +321,109 @@ class UGRIMDCriterion(nn.Module):
         mask[values.topk(count).indices] = True
         return mask
 
-    def compute_score_losses(self, teacher_vl, student_vl, teacher_l, student_l, teacher_grounding):
-        """Compute the two independent objectives from [B, K] candidate scores."""
+    def compute_score_losses(
+        self,
+        teacher_vl: torch.Tensor,
+        student_vl: torch.Tensor,
+        teacher_l: torch.Tensor,
+        student_l: torch.Tensor,
+        teacher_grounding: torch.Tensor,
+        student_grounding: torch.Tensor,
+    ):
+        """Compute UGRIMD ranking and cross-condition interaction losses."""
         eps = self.rank_epsilon
-        _bsz, candidate_count = teacher_vl.shape
-        pair_i, pair_j = torch.triu_indices(candidate_count, candidate_count, offset=1, device=teacher_vl.device)
-        teacher_margin = (teacher_vl[:, pair_i] - teacher_vl[:, pair_j]).detach()
+        _, candidate_count = teacher_vl.shape
+
+        teacher_probs_vl = torch.softmax(
+            teacher_vl.detach() / self.candidate_temperature, dim=-1
+        )
+        teacher_uncertainty = -(
+            teacher_probs_vl * teacher_probs_vl.clamp_min(self.loss_epsilon).log()
+        ).sum(dim=-1) / math.log(max(candidate_count, 2))
+        teacher_uncertainty = teacher_uncertainty.clamp(0.0, 1.0)
+        teacher_certainty = 1.0 - teacher_uncertainty
+
+        # Pairwise preference probabilities and normalized binary entropies.
+        pair_i, pair_j = torch.triu_indices(
+            candidate_count, candidate_count, offset=1, device=teacher_vl.device
+        )
+        teacher_margin = (
+            teacher_vl[:, pair_i] - teacher_vl[:, pair_j]
+        ).detach()
         student_margin = student_vl[:, pair_i] - student_vl[:, pair_j]
         q_teacher = torch.sigmoid(teacher_margin / self.rank_temperature)
         q_student = torch.sigmoid(student_margin / self.rank_temperature)
-        teacher_probs_vl = torch.softmax(teacher_vl.detach() / self.candidate_temperature, dim=-1)
-        teacher_uncertainty = -(teacher_probs_vl * (teacher_probs_vl + self.loss_epsilon).log()).sum(dim=-1)
-        teacher_uncertainty = teacher_uncertainty / math.log(max(candidate_count, 2))
-        teacher_certainty = 1 - teacher_uncertainty
-        visual_margin = (teacher_grounding[:, pair_i] - teacher_grounding[:, pair_j]).detach()
+        teacher_pair_uncertainty = self._binary_entropy(q_teacher, eps).clamp(0.0, 1.0)
+        student_pair_uncertainty = self._binary_entropy(q_student, eps).clamp(0.0, 1.0)
+
+        # Visual agreement compares teacher and student grounding *differences*.
+        teacher_visual_margin = (
+            teacher_grounding[:, pair_i] - teacher_grounding[:, pair_j]
+        ).detach()
+        student_visual_margin = (
+            student_grounding[:, pair_i] - student_grounding[:, pair_j]
+        ).detach()
+        grounding_delta = teacher_visual_margin * student_visual_margin
         visual_agreement = torch.sigmoid(
-            (teacher_margin * visual_margin) / self.visual_weight_temperature
+            grounding_delta / self.visual_weight_temperature
         ).detach()
         visual_reliability = (
             self.visual_weight_floor
-            + (1 - self.visual_weight_floor) * visual_agreement
+            + (1.0 - self.visual_weight_floor) * visual_agreement
         ).detach()
-        # Pair supervision is teacher-certain + student-uncertain, additionally
-        # modulated by sample-level certainty and vision-aware teacher
-        # reliability. This is a weight only; it creates no visual loss.
+
+        # Pair gate excludes example-level certainty; that is applied only after
+        # the weighted pair losses have been normalized within each example.
         rank_gate = (
-            teacher_certainty[:, None]
-            * (1 - self._binary_entropy(q_teacher, eps))
-            * self._binary_entropy(q_student, eps)
+            (1.0 - teacher_pair_uncertainty)
+            * student_pair_uncertainty
             * visual_reliability
+        ).detach()
+        rank_bce = -(
+            q_teacher * q_student.clamp_min(eps).log()
+            + (1.0 - q_teacher) * (1.0 - q_student).clamp_min(eps).log()
         )
-        selected_pairs = self._top_mask(rank_gate.detach().flatten(), self.pair_top_percent).reshape_as(rank_gate)
-        rank_gate = rank_gate * selected_pairs
-        rank_bce = -(q_teacher * (q_student + eps).log() + (1 - q_teacher) * (1 - q_student + eps).log())
-        rank_per_sample = (rank_gate * rank_bce).sum(dim=-1) / (rank_gate.sum(dim=-1) + self.loss_epsilon)
+        pair_weight_sum = rank_gate.sum(dim=-1)
+        weighted_pair_loss = (rank_gate * rank_bce).sum(dim=-1)
+        rank_per_sample = torch.where(
+            pair_weight_sum > 0,
+            weighted_pair_loss / pair_weight_sum.clamp_min(self.loss_epsilon),
+            torch.zeros_like(weighted_pair_loss),
+        )
         rank_loss = (teacher_certainty * rank_per_sample).mean()
 
-        p_teacher_vl = teacher_probs_vl
-        p_teacher_l = torch.softmax(teacher_l.detach() / self.candidate_temperature, dim=-1)
-        p_student_vl = torch.softmax(student_vl / self.candidate_temperature, dim=-1)
-        p_student_l = torch.softmax(student_l / self.candidate_temperature, dim=-1)
-        teacher_shift = (p_teacher_vl - p_teacher_l).detach()
+        # Cross-condition probability shifts, weighted by teacher uncertainty
+        # and the bounded magnitude of the teacher's response to visual input.
+        p_teacher_l = torch.softmax(
+            teacher_l.detach() / self.candidate_temperature, dim=-1
+        )
+        p_student_vl = torch.softmax(
+            student_vl / self.candidate_temperature, dim=-1
+        )
+        p_student_l = torch.softmax(
+            student_l / self.candidate_temperature, dim=-1
+        )
+        teacher_shift = (teacher_probs_vl - p_teacher_l).detach()
         student_shift = p_student_vl - p_student_l
         strength = 0.5 * teacher_shift.abs().sum(dim=-1)
-        # Teacher uncertainty chooses interaction; student uncertainty has
-        # already selected this sample and is not used as a loss weight.
-        interaction_gate = teacher_uncertainty * strength / (strength + self.strength_temperature)
-        interaction_per_sample = F.smooth_l1_loss(student_shift, teacher_shift, reduction="none", beta=self.interaction_temperature).mean(dim=-1)
-        interaction_loss = (interaction_per_sample * interaction_gate).sum() / (interaction_gate.sum() + self.loss_epsilon)
-        return rank_loss, interaction_loss, teacher_uncertainty.mean(), interaction_gate.sum(), visual_reliability.mean()
+        normalized_strength = strength / (strength + self.strength_temperature)
+        interaction_gate = (teacher_uncertainty * normalized_strength).detach()
+        interaction_per_sample = F.smooth_l1_loss(
+            student_shift,
+            teacher_shift,
+            reduction="none",
+            beta=self.interaction_temperature,
+        ).mean(dim=-1)
+        # The paper defines a weighted batch mean, not normalization by total gate mass.
+        interaction_loss = (interaction_gate * interaction_per_sample).mean()
+
+        return (
+            rank_loss,
+            interaction_loss,
+            teacher_uncertainty.mean(),
+            interaction_gate.sum(),
+            visual_reliability.mean() if visual_reliability.numel() else teacher_vl.new_zeros(()),
+        )
 
     def forward(self, distiller: Any, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         student_outputs = distiller.student(**batch["student_inputs"])
@@ -346,8 +435,10 @@ class UGRIMDCriterion(nn.Module):
             raise RuntimeError("UGRIMD requires candidate_messages from VlmDistillDataCollator.")
         candidates = self._candidates(distiller, batch["ids"], messages)
         student_processor = distiller.get_student_processor()
-        student_vl = self._scores(distiller.student, student_processor, messages, candidates, False, True)
-        hard_mask, student_uncertainty = self._hard_sample_mask(batch["ids"], student_vl)
+        student_vl_all, student_grounding_all = self._student_vl_scores_and_grounding(
+            distiller.student, student_processor, messages, candidates
+        )
+        hard_mask, student_uncertainty = self._hard_sample_mask(batch["ids"], student_vl_all)
         hard_indices = hard_mask.nonzero(as_tuple=False).flatten()
         if hard_indices.numel() == 0:
             zero = ce_loss.new_zeros(())
@@ -356,13 +447,17 @@ class UGRIMDCriterion(nn.Module):
         selected_messages = [messages[index] for index in selected_indices]
         selected_candidates = [candidates[index] for index in selected_indices]
         selected_ids = [batch["ids"][index] for index in selected_indices]
-        student_vl = student_vl.index_select(0, hard_indices)
-        student_l = self._scores(distiller.student, student_processor, selected_messages, selected_candidates, True, True)
+        student_vl = student_vl_all.index_select(0, hard_indices)
+        student_grounding = student_grounding_all.index_select(0, hard_indices)
+        student_l = self._scores(
+            distiller.student, student_processor, selected_messages, selected_candidates,
+            language_only=True, requires_grad=True,
+        )
         teacher_vl, teacher_l, teacher_grounding = self._cached_teacher_scores(
             distiller, selected_ids, selected_messages, selected_candidates, student_vl.device
         )
         rank_loss, interaction_loss, teacher_uncertainty, active_interaction, visual_reliability = self.compute_score_losses(
-            teacher_vl, student_vl, teacher_l, student_l, teacher_grounding
+            teacher_vl, student_vl, teacher_l, student_l, teacher_grounding, student_grounding
         )
         total = ce_loss + self.distill_lambda * (rank_loss + self.interaction_lambda * interaction_loss)
         return {"loss": total, "supervised_loss": ce_loss.detach(), "rank_loss": rank_loss.detach(), "interaction_loss": interaction_loss.detach(), "visual_ranking_weight": visual_reliability.detach(), "student_uncertainty": student_uncertainty.mean().detach(), "teacher_uncertainty": teacher_uncertainty.detach(), "hard_sample_count": hard_mask.sum().detach(), "active_interaction_samples": active_interaction.detach()}
