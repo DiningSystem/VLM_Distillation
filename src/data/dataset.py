@@ -410,7 +410,7 @@ class LazyVlmDistillDataset(Dataset):
 
         self.list_data_dict = []
         self.skipped_missing_images = 0
-        for sample in samples:
+        for sample_index, sample in enumerate(samples):
             image_paths = _resolve_sample_image_paths(self.base_dir, sample)
             # Skip multimodal samples as soon as any declared image file is
             # absent.  This prevents lazy PIL loading from crashing later and
@@ -426,7 +426,9 @@ class LazyVlmDistillDataset(Dataset):
                 continue
 
             base_sample = {
-                "id": sample.get("id"),
+                # A stable fallback is required by candidate-cache based
+                # distillation methods when source JSON does not provide ids.
+                "id": sample.get("id", sample_index),
                 "image_path": image_path,
                 "conversations": _normalize_conversations(conversations),
             }
@@ -690,6 +692,12 @@ class VlmDistillDataCollator:
             "image_paths": [instance["image_path"] for instance in instances],
             "student_inputs": student_inputs,
         }
+
+        # Keep the original multimodal conversations as criterion metadata.
+        # UGRIMD rebuilds candidate-specific teacher-forcing inputs with each
+        # model's own processor; these must never be inferred from token IDs.
+        if _get_arg(self.data_args, "kd_loss_type") == "ugrimd":
+            batch["candidate_messages"] = conversations
 
         if self.use_teacher:
             teacher_inputs = self._apply_processor(
